@@ -1,0 +1,142 @@
+from azureml.core.run import Run
+from azureml.core import Dataset, Datastore, Workspace
+import os
+import argparse
+import joblib
+import json
+
+# Import your training functions
+from train import split_data, train_model, get_model_metrics
+
+
+def register_dataset(
+    aml_workspace: Workspace,
+    dataset_name: str,
+    datastore_name: str,
+    file_path: str
+) -> Dataset:
+    """
+    Register a new version of the dataset in Azure ML workspace.
+    """
+    datastore = Datastore.get(aml_workspace, datastore_name)
+    dataset = Dataset.Tabular.from_delimited_files(path=(datastore, file_path))
+    dataset = dataset.register(workspace=aml_workspace,
+                               name=dataset_name,
+                               create_new_version=True)
+    return dataset
+
+
+def main():
+    print("Running train_aml.py")
+
+    # Parse input arguments
+    parser = argparse.ArgumentParser("train")
+    parser.add_argument(
+        "--model_name",
+        type=str,
+        help="Name of the Model",
+        default="insurance_model.pkl",
+    )
+    parser.add_argument(
+        "--data_file_path",
+        type=str,
+        help=("data file path, if specified, a new version of the dataset will be registered"),
+        default="insurance",
+    )
+    parser.add_argument(
+        "--dataset_name",
+        type=str,
+        help="Dataset name",
+        default="insurance_dataset",
+    )
+
+    args = parser.parse_args()
+
+    print("Argument [model_name]: %s" % args.model_name)
+    print("Argument [data_file_path]: %s" % args.data_file_path)
+    print("Argument [dataset_name]: %s" % args.dataset_name)
+
+    model_name = args.model_name
+    data_file_path = args.data_file_path
+    dataset_name = args.dataset_name
+
+    # Get Azure ML run context
+    run = Run.get_context()
+
+    print("Getting training parameters")
+
+    # Load training parameters from parameters.json
+    with open("parameters.json") as f:
+        pars = json.load(f)
+    try:
+        train_args = pars["training"]
+    except KeyError:
+        print("Could not load training values from file")
+        train_args = {}
+
+    # Log the training parameters
+    print(f"Parameters: {train_args}")
+    for (k, v) in train_args.items():
+        run.log(k, v)
+
+    # Retrieve or register the dataset in Azure ML
+    if dataset_name:
+        if data_file_path == 'none':
+            dataset = Dataset.get_by_name(run.experiment.workspace, dataset_name)
+        else:
+            dataset = register_dataset(run.experiment.workspace,
+                                       dataset_name,
+                                       "workspaceblobstore",
+                                       data_file_path)
+    else:
+        e = "No dataset provided"
+        print(e)
+        raise Exception(e)
+
+    # Link dataset to the step run so it is trackable in the UI
+    run.input_datasets['training_data'] = dataset
+
+    # Convert the TabularDataset to a Pandas DataFrame
+    df = dataset.to_pandas_dataframe()
+
+    # --- FIX: Convert problematic columns to numeric or category ---
+    # For example, convert 'ps_ind_04_cat' to a category
+    if 'ps_ind_04_cat' in df.columns:
+        df['ps_ind_04_cat'] = df['ps_ind_04_cat'].astype('category')
+
+    # Split the data into train/test
+    data = split_data(df)
+
+    # Train the model with early stopping
+    early_stopping_rounds = train_args.get("early_stopping_rounds", 10)
+    model = train_model(data, train_args, early_stopping_rounds=early_stopping_rounds)
+
+    # Evaluate and log metrics
+    metrics = get_model_metrics(model, data)
+    for (k, v) in metrics.items():
+        run.log(k, v)
+
+    # Save model to outputs folder
+    os.makedirs('outputs', exist_ok=True)
+    output_path = os.path.join('outputs', model_name)
+    joblib.dump(value=model, filename=output_path)
+
+    # Tag and upload model artifact
+    run.tag("run_type", value="train")
+    print(f"tags now present for run: {run.tags}")
+
+    print("Uploading the model into run artifacts...")
+    run.upload_file(name="./outputs/models/" + model_name, path_or_stream=output_path)
+    print(f"Uploaded the model {model_name} to experiment {run.experiment.name}")
+
+    dirpath = os.getcwd()
+    print(dirpath)
+    print("Following files are uploaded:")
+    print(run.get_file_names())
+
+    # Complete the run
+    run.complete()
+
+
+if __name__ == '__main__':
+    main()
